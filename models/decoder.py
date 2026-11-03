@@ -11,15 +11,15 @@ import torch.nn.functional as F
 
 class AdaINLayer(nn.Module):
     """
-    Adaptive Instance Normalization modulated by a global style vector w_style.
+    Adaptive Instance Normalization modulated by the quantized attribute style vector w_style.
     """
 
     def __init__(self, channels: int, style_dim: int):
         super().__init__()
         self.norm = nn.InstanceNorm2d(channels, affine=False)
         self.style_proj = nn.Linear(style_dim, channels * 2)
-        # Initialize scale near 1 and bias near 0
-        nn.init.zeros_(self.style_proj.weight)
+        # Small non-zero weight initialization so gradients flow immediately into w_style / z_quant!
+        nn.init.normal_(self.style_proj.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.style_proj.bias)
 
     def forward(self, x: torch.Tensor, w_style: torch.Tensor) -> torch.Tensor:
@@ -30,7 +30,7 @@ class AdaINLayer(nn.Module):
 
 class SPADEResidualModulation(nn.Module):
     """
-    Spatial modulation conditioned on the resized spatial residual map Z_res
+    Spatial palette/lighting modulation conditioned on the smooth residual map Z_res
     fused with the attribute style vector w_style.
     """
 
@@ -61,8 +61,9 @@ class SPADEResidualModulation(nn.Module):
 
 class ModulatedDecodeBlock(nn.Module):
     """
-    Residual block combining AdaIN attribute modulation and SPADE residual conditioning,
-    optionally preceded by 2x spatial upsampling.
+    Upsampling block combining AdaIN attribute modulation (for texture geometry)
+    and SPADE residual conditioning (for regional color palette & lighting).
+    Uses bilinear upsampling to avoid checkerboard/grid artifacts.
     """
 
     def __init__(
@@ -88,7 +89,7 @@ class ModulatedDecodeBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, z_res: torch.Tensor, w_style: torch.Tensor) -> torch.Tensor:
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+            x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
 
         residual = self.skip(x)
         out = self.conv1(x)
@@ -134,10 +135,11 @@ class TextureDecoder(nn.Module):
         self.block_128 = ModulatedDecodeBlock(256, 128, res_channels, style_dim, upsample=True)
         self.block_256 = ModulatedDecodeBlock(128, 64, res_channels, style_dim, upsample=True)
 
+        # IMPORTANT: No InstanceNorm2d before to_rgb! InstanceNorm2d before the final conv
+        # erases per-image RGB color offsets (turning outputs gray) and causes extreme highlight clipping.
         self.to_rgb = nn.Sequential(
-            nn.InstanceNorm2d(64, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, out_channels, kernel_size=7, padding=3, padding_mode="reflect"),
+            nn.Conv2d(64, out_channels, kernel_size=3, padding=1, padding_mode="reflect"),
             nn.Tanh(),
         )
 
@@ -152,4 +154,3 @@ class TextureDecoder(nn.Module):
         h = self.block_128(h, z_res, w_style)
         h = self.block_256(h, z_res, w_style)
         return self.to_rgb(h)
-

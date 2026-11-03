@@ -431,18 +431,25 @@ class CoTyleTrainer:
 
     def load_checkpoint(self, path: str) -> int:
         ckpt = torch.load(path, map_location=self.device)
-        self.encoder.load_state_dict(ckpt["encoder"])
-        self.codebook.load_state_dict(ckpt["codebook"])
-        self.decoder.load_state_dict(ckpt["decoder"])
-        self.supervisor.load_state_dict(ckpt["supervisor"])
-        if "opt_g" in ckpt:
-            self.opt_g.load_state_dict(ckpt["opt_g"])
-        if "opt_d" in ckpt:
-            self.opt_d.load_state_dict(ckpt["opt_d"])
         epoch = int(ckpt.get("epoch", 0))
         pretrain_epochs = int(self.cfg.get("optim", {}).get("pretrain_epochs", 15))
-        if "opt_sup_pretrain" in ckpt and epoch < pretrain_epochs:
+
+        # Always load the trained Supervisor
+        self.supervisor.load_state_dict(ckpt["supervisor"])
+
+        # Only load Generator (Encoder/Codebook/Decoder) if resuming from Phase 2 (epoch > pretrain_epochs)
+        # or if state_dict keys match (during Phase 1, Generator was untouched).
+        if epoch > pretrain_epochs:
+            self.encoder.load_state_dict(ckpt["encoder"])
+            self.codebook.load_state_dict(ckpt["codebook"])
+            self.decoder.load_state_dict(ckpt["decoder"])
+            if "opt_g" in ckpt:
+                self.opt_g.load_state_dict(ckpt["opt_g"])
+            if "opt_d" in ckpt:
+                self.opt_d.load_state_dict(ckpt["opt_d"])
+        elif "opt_sup_pretrain" in ckpt and epoch < pretrain_epochs:
             self.opt_sup_pretrain.load_state_dict(ckpt["opt_sup_pretrain"])
+
         del ckpt
         if self.device.type == "cuda":
             torch.cuda.empty_cache()

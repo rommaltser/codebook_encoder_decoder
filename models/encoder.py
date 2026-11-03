@@ -1,25 +1,41 @@
 """
 Dual-Branch Texture Encoder (E):
 Extracts:
-  1. Spatial residual map Z_res in R^{B x C_res x H' x W'} (palette, lighting, fine stochastic detail)
+  1. Spatial residual map Z_res in R^{B x C_res x 16 x 16}
+     Preserves RGB color palette, lighting gradients, and coarse stochastic layout
+     WITHOUT InstanceNorm color-stripping, while using a spatial/channel bottleneck (16 channels at 16x16)
+     so sharp geometric edges cannot bypass the Factorized Codebook.
   2. K semantic attribute vectors Z_attr in R^{B x K x D}
 """
 
 from typing import Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ConvResBlock(nn.Module):
-    def __init__(self, channels: int, norm_type: str = "instance"):
+    def __init__(self, channels: int, norm_type: str = "batch"):
         super().__init__()
-        norm_layer = nn.InstanceNorm2d if norm_type == "instance" else nn.BatchNorm2d
+        if norm_type == "instance":
+            norm1 = nn.InstanceNorm2d(channels, affine=True)
+            norm2 = nn.InstanceNorm2d(channels, affine=True)
+        elif norm_type == "group":
+            norm1 = nn.GroupNorm(8, channels)
+            norm2 = nn.GroupNorm(8, channels)
+        elif norm_type == "none":
+            norm1 = nn.Identity()
+            norm2 = nn.Identity()
+        else:
+            norm1 = nn.BatchNorm2d(channels)
+            norm2 = nn.BatchNorm2d(channels)
+
         self.block = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode="reflect", bias=False),
-            norm_layer(channels, affine=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode="reflect", bias=(norm_type == "none")),
+            norm1,
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode="reflect", bias=False),
-            norm_layer(channels, affine=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode="reflect", bias=(norm_type == "none")),
+            norm2,
         )
         self.act = nn.LeakyReLU(0.2, inplace=True)
 
@@ -30,8 +46,8 @@ class ConvResBlock(nn.Module):
 class TextureEncoder(nn.Module):
     """
     Dual-branch convolutional encoder splitting input textures [B, 3, 256, 256] into:
-      - z_attr: [B, K, latent_dim]
-      - z_res:  [B, res_channels, 32, 32]
+      - z_attr: [B, K, latent_dim] (structural & surface attributes)
+      - z_res:  [B, res_channels, 32, 32] (color palette, lighting, coarse stochastic residual)
     """
 
     def __init__(
@@ -48,8 +64,29 @@ class TextureEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.res_channels = res_channels
 
-        # Shared Stem: 256x256 -> 128x128 -> 64x64 -> 32x32
-        self.stem = nn.Sequential(
+        # Branch 1: Color-Preserving Residual Path (NO InstanceNorm so RGB palette & lighting are preserved!)
+        # Uses smooth average pooling down to 16x16 and a narrow 16-channel bottleneck to prevent geometry leakage,
+        # then expands to [B, res_channels, 32, 32] for the decoder.
+        bottleneck_ch = 16
+        self.res_color_stem = nn.Sequential(
+            nn.AvgPool2d(kernel_size=4, stride=4),  # 256 -> 64 (smooth color/lighting downsample)
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1, padding_mode="reflect"),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.AvgPool2d(kernel_size=4, stride=4),  # 64 -> 16 (strips fine geometric edges, keeps palette & lighting)
+            nn.Conv2d(base_channels, bottleneck_ch, kernel_size=3, padding=1, padding_mode="reflect"),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout2d(p=res_dropout) if res_dropout > 0 else nn.Identity(),
+        )
+        self.res_expand = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # 16 -> 32
+            nn.Conv2d(bottleneck_ch, res_channels, kernel_size=3, padding=1, padding_mode="reflect"),
+            nn.LeakyReLU(0.2, inplace=True),
+            ConvResBlock(res_channels, norm_type="none"),
+        )
+
+        # Branch 2: Semantic Attribute Extractor Z_attr [B, K, latent_dim]
+        # Uses InstanceNorm/BatchNorm to focus on invariant texture structure & geometry
+        self.attr_stem = nn.Sequential(
             nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=1, padding=3, padding_mode="reflect", bias=False),
             nn.InstanceNorm2d(base_channels, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
@@ -68,18 +105,6 @@ class TextureEncoder(nn.Module):
             ConvResBlock(base_channels * 4, norm_type="instance"),
         )
 
-        # Branch 1: Spatial Residual Z_res [B, res_channels, 32, 32]
-        # Uses channel bottleneck + InstanceNorm + optional spatial dropout to limit semantic shape leakage
-        self.res_branch = nn.Sequential(
-            ConvResBlock(base_channels * 4, norm_type="instance"),
-            nn.Conv2d(base_channels * 4, res_channels, kernel_size=1, stride=1, bias=False),
-            nn.InstanceNorm2d(res_channels, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout2d(p=res_dropout) if res_dropout > 0 else nn.Identity(),
-        )
-
-        # Branch 2: Semantic Attribute Extractor Z_attr [B, K, latent_dim]
-        # Further downsamples 32 -> 16 -> 8 and pools global texture statistics
         attr_feat_dim = base_channels * 8
         self.attr_trunk = nn.Sequential(
             nn.Conv2d(base_channels * 4, base_channels * 6, kernel_size=4, stride=2, padding=1, bias=False),
@@ -91,7 +116,7 @@ class TextureEncoder(nn.Module):
             ConvResBlock(attr_feat_dim, norm_type="batch"),
         )
 
-        # Combine Global Avg Pool + Global Std/Max Pool for texture descriptor richness
+        # Combine Global Avg Pool + Global Max Pool for texture descriptor richness
         self.attr_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(attr_feat_dim * 2, latent_dim),
@@ -103,9 +128,12 @@ class TextureEncoder(nn.Module):
         ])
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        feat = self.stem(x)
-        z_res = self.res_branch(feat)
+        # 1. Color & lighting residual (without InstanceNorm color erasure)
+        z_res_low = self.res_color_stem(x)
+        z_res = self.res_expand(z_res_low)
 
+        # 2. Structural & semantic attribute vectors
+        feat = self.attr_stem(x)
         attr_map = self.attr_trunk(feat)
         avg_pool = attr_map.mean(dim=(2, 3))
         max_pool = attr_map.amax(dim=(2, 3))
@@ -114,4 +142,3 @@ class TextureEncoder(nn.Module):
         z_attr_list = [head(global_feat) for head in self.attr_heads]
         z_attr = torch.stack(z_attr_list, dim=1)  # [B, K, latent_dim]
         return z_attr, z_res
-
