@@ -3,7 +3,7 @@ data:
   img_dir: "/content/dtd/images"
   labels_json: "/content/drive/MyDrive/tau material/datasets/dtd-pseudo-labled-Qwen2.5-VL-32B-AWQ"
   img_size: 256
-  batch_size: 64            # A100 (40GB VRAM) easily handles batch_size=64 with AMP + TF32
+  batch_size: 32            # Fits Dual-Decoder (x_rec + x_swap) + LPIPS + ResNet50 comfortably in <15GB on A100
   num_workers: 4
   val_split: 0.1
 
@@ -39,3 +39,4 @@ optim:
   save_dir: "/content/drive/MyDrive/tau material/datasets/dtd-pseudo-labled-Qwen2.5-VL-32B-AWQ/checkpoints_cotyle"
   log_interval: 10
   vis_interval: 5
+

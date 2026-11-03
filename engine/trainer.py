@@ -71,12 +71,11 @@ class PerceptualLoss(nn.Module):
         return loss
 
     def forward(self, x_pred: torch.Tensor, x_target: torch.Tensor) -> torch.Tensor:
-        with torch.cuda.amp.autocast(enabled=False):
-            x_pred_f32 = x_pred.float()
-            x_target_f32 = x_target.float()
-            if self.lpips_fn is not None:
-                return self.lpips_fn(x_pred_f32, x_target_f32).mean()
-            return self._offline_multiscale_texture_loss(x_pred_f32, x_target_f32)
+        if self.lpips_fn is not None:
+            # LPIPS VGG16 runs safely and with 2x lower VRAM under AMP autocast
+            return self.lpips_fn(x_pred, x_target).mean()
+        with torch.amp.autocast("cuda", enabled=False):
+            return self._offline_multiscale_texture_loss(x_pred.float(), x_target.float())
 
 
 class CoTyleTrainer:
@@ -104,7 +103,7 @@ class CoTyleTrainer:
 
         model_cfg = cfg.get("model", {})
         self.use_amp = bool(model_cfg.get("use_amp", True)) and (device.type == "cuda")
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp) if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler") else torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
         loss_cfg = cfg.get("loss_weights", {})
         self.w_recon_l1 = float(loss_cfg.get("recon_l1", 1.0))
@@ -179,7 +178,7 @@ class CoTyleTrainer:
             y_real = y_real.to(self.device)
 
             self.opt_sup_pretrain.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
                 logits, _ = self.supervisor(x_real, return_attr=True, return_patch=False)
                 assert logits is not None
                 loss_sup = self.compute_supervisor_ce(logits, y_real)
@@ -238,6 +237,12 @@ class CoTyleTrainer:
 
         last_batch_vis = None
 
+        # Free Phase 1 pretrain optimizer states if still allocated to reclaim VRAM for Phase 2
+        if len(self.opt_sup_pretrain.state) > 0:
+            self.opt_sup_pretrain.state.clear()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
         for step, (x_a, y_a) in enumerate(loader, start=1):
             x_a = x_a.to(self.device)
             y_a = y_a.to(self.device)
@@ -248,7 +253,7 @@ class CoTyleTrainer:
             self.supervisor.requires_grad_(False)
             self.opt_g.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
                 # =================================================================
                 # 1. Forward Pass & Quantization
                 # =================================================================
@@ -260,7 +265,7 @@ class CoTyleTrainer:
                 # =================================================================
                 x_rec = self.decoder(z_quant_a, z_res_a)
                 loss_l1 = F.l1_loss(x_rec, x_a)
-                loss_lpips = self.perceptual_loss(x_rec.float(), x_a.float())
+                loss_lpips = self.perceptual_loss(x_rec, x_a)
                 loss_recon = self.w_recon_l1 * loss_l1 + self.w_recon_lpips * loss_lpips
 
                 # =================================================================
@@ -325,7 +330,7 @@ class CoTyleTrainer:
                 self.supervisor.attr_heads.requires_grad_(True)
 
             self.opt_d.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
                 logits_real, d_pred_real = self.supervisor(
                     x_a, return_attr=(self.sup_finetune_scale > 0.0), return_patch=True
                 )
@@ -434,6 +439,11 @@ class CoTyleTrainer:
             self.opt_g.load_state_dict(ckpt["opt_g"])
         if "opt_d" in ckpt:
             self.opt_d.load_state_dict(ckpt["opt_d"])
-        if "opt_sup_pretrain" in ckpt:
+        epoch = int(ckpt.get("epoch", 0))
+        pretrain_epochs = int(self.cfg.get("optim", {}).get("pretrain_epochs", 15))
+        if "opt_sup_pretrain" in ckpt and epoch < pretrain_epochs:
             self.opt_sup_pretrain.load_state_dict(ckpt["opt_sup_pretrain"])
-        return int(ckpt.get("epoch", 0))
+        del ckpt
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return epoch
