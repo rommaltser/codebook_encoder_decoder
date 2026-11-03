@@ -1,0 +1,39 @@
+data:
+  img_dir: "dtd/images"
+  labels_json: "~/Downloads/dtd-pseudo-labled-Qwen2.5-VL-32B-AWQ-20261103T120624Z-1-001"
+  img_size: 256
+  batch_size: 16
+  num_workers: 4
+  val_split: 0.1
+
+model:
+  latent_dim: 128
+  res_channels: 128
+  num_clusters: 6           # Set to 8 if using chromatic_quality & hue from labeling
+  words_per_cluster: 24
+  vq_beta: 0.25
+  align_codebook: true      # Aligns VQ table indices 0..23 directly with lexicon word indices
+  res_dropout: 0.1          # Spatial dropout on Z_res to prevent geometry leakage
+  supervisor_backbone: "resnet50"
+  pretrained_supervisor: false
+  use_amp: true             # Mixed precision training for low VRAM footprint
+
+loss_weights:
+  recon_l1: 1.0
+  recon_lpips: 0.8
+  vq: 0.25
+  vq_align: 0.5
+  swap_attr: 0.5
+  adv_patch: 0.1
+
+optim:
+  lr_g: 0.0002
+  lr_d: 0.0002
+  sup_finetune_lr_scale: 0.1
+  beta1: 0.5
+  beta2: 0.999
+  pretrain_epochs: 15
+  max_epochs: 100
+  save_dir: "checkpoints"
+  log_interval: 20
+  vis_interval: 5

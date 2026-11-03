@@ -1,0 +1,41 @@
+data:
+  # Local Colab SSD path (staged from Drive or downloaded for 10x faster I/O than Drive FUSE)
+  img_dir: "/content/dtd/images"
+  labels_json: "/content/drive/MyDrive/tau material/datasets/dtd-pseudo-labled-Qwen2.5-VL-32B-AWQ"
+  img_size: 256
+  batch_size: 64            # A100 (40GB VRAM) easily handles batch_size=64 with AMP + TF32
+  num_workers: 4
+  val_split: 0.1
+
+model:
+  latent_dim: 128
+  res_channels: 128
+  num_clusters: 6           # Set to 8 if including chromatic_quality & hue
+  words_per_cluster: 24
+  vq_beta: 0.25
+  align_codebook: true
+  res_dropout: 0.1
+  supervisor_backbone: "resnet50"
+  pretrained_supervisor: true
+  use_amp: true
+
+loss_weights:
+  recon_l1: 1.0
+  recon_lpips: 0.8
+  vq: 0.25
+  vq_align: 0.5
+  swap_attr: 0.5
+  adv_patch: 0.1
+
+optim:
+  lr_g: 0.0002
+  lr_d: 0.0002
+  sup_finetune_lr_scale: 0.1
+  beta1: 0.5
+  beta2: 0.999
+  pretrain_epochs: 15
+  max_epochs: 100
+  # Save checkpoints directly to Google Drive so progress persists across Colab sessions
+  save_dir: "/content/drive/MyDrive/tau material/datasets/dtd-pseudo-labled-Qwen2.5-VL-32B-AWQ/checkpoints_cotyle"
+  log_interval: 10
+  vis_interval: 5

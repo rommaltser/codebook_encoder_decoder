@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+env/
+venv/
+.venv/
+checkpoints/
+*.pt
+*.pth
+dtd/
+*.zip
+*.tar.gz
+.DS_Store
+.ipynb_checkpoints/
