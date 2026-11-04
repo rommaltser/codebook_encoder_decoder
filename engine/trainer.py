@@ -296,12 +296,23 @@ class CoTyleTrainer:
                 _, d_pred_fake_rec = self.supervisor(x_rec, return_attr=False, return_patch=True)
                 assert logits_swap is not None and d_pred_fake_swap is not None and d_pred_fake_rec is not None
 
-                loss_swap_attr = x_a.new_tensor(0.0)
-                for k in range(num_clusters):
-                    target_k = y_b[:, k] if k == k_star else y_a[:, k]
-                    weight_k = 2.0 if k == k_star else 1.0
-                    loss_swap_attr = loss_swap_attr + weight_k * F.cross_entropy(logits_swap[k], target_k)
-                loss_swap_attr = loss_swap_attr / float(num_clusters + 1)
+                # Target for head k*: y_B[:, k*] (enforces attribute change, 65% weight)
+                # Target for head k != k*: y_A[:, k] (enforces attribute preservation, 35% shared weight)
+                loss_edit_k = F.cross_entropy(logits_swap[k_star], y_b[:, k_star])
+                if num_clusters > 1:
+                    loss_preserve = sum(
+                        F.cross_entropy(logits_swap[k], y_a[:, k])
+                        for k in range(num_clusters) if k != k_star
+                    ) / float(num_clusters - 1)
+                else:
+                    loss_preserve = x_a.new_tensor(0.0)
+
+                # Latent cycle-consistency on swapped image: re-encoding x_swap must recover the swapped token k*
+                z_attr_swap, _ = self.encoder(x_swap)
+                z_swap_norm_k = self.codebook._norm_vec(z_attr_swap[:, k_star, :])
+                loss_latent_cycle = F.mse_loss(z_swap_norm_k, z_swapped[:, k_star, :].detach())
+
+                loss_swap_attr = 0.65 * loss_edit_k + 0.35 * loss_preserve + 0.5 * loss_latent_cycle
 
                 loss_adv_g = 0.5 * (
                     self._gan_loss(d_pred_fake_swap, target_is_real=True)

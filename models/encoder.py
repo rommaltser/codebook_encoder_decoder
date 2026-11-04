@@ -1,10 +1,15 @@
 """
 Dual-Branch Texture Encoder (E):
 Extracts:
-  1. Spatial residual map Z_res in R^{B x C_res x 16 x 16}
-     Preserves RGB color palette, lighting gradients, and coarse stochastic layout
-     WITHOUT InstanceNorm color-stripping, while using a spatial/channel bottleneck (16 channels at 16x16)
-     so sharp geometric edges cannot bypass the Factorized Codebook.
+  1. Spatial residual map Z_res in R^{B x C_res x 32 x 32}:
+     Strictly disentangled non-semantic residual containing:
+       - Channels 0..2: Smooth 4x4 low-pass RGB color & lighting canvas (upsampled to 32x32)
+       - Channels 3..5: Global per-image RGB mean mu_rgb
+       - Channels 6..8: Global per-image RGB std sigma_rgb
+       - Channels 9..C_res-1: Spatially uncorrelated stochastic noise seed (projected from per-pixel scrambled luminance)
+     Because Z_res has NO learned multi-pixel convolutional filters on x, it is mathematically
+     incapable of leaking geometric element shapes (stripes, bubbles, hexagons, grids), forcing
+     100% of texture geometry through the Factorized Codebook Z_quant while preserving 100% of RGB color!
   2. K semantic attribute vectors Z_attr in R^{B x K x D}
 """
 
@@ -20,9 +25,6 @@ class ConvResBlock(nn.Module):
         if norm_type == "instance":
             norm1 = nn.InstanceNorm2d(channels, affine=True)
             norm2 = nn.InstanceNorm2d(channels, affine=True)
-        elif norm_type == "group":
-            norm1 = nn.GroupNorm(8, channels)
-            norm2 = nn.GroupNorm(8, channels)
         elif norm_type == "none":
             norm1 = nn.Identity()
             norm2 = nn.Identity()
@@ -45,9 +47,9 @@ class ConvResBlock(nn.Module):
 
 class TextureEncoder(nn.Module):
     """
-    Dual-branch convolutional encoder splitting input textures [B, 3, 256, 256] into:
+    Dual-branch encoder splitting input textures [B, 3, 256, 256] into:
       - z_attr: [B, K, latent_dim] (structural & surface attributes)
-      - z_res:  [B, res_channels, 32, 32] (color palette, lighting, coarse stochastic residual)
+      - z_res:  [B, res_channels, 32, 32] (RGB palette, lighting, and non-semantic stochastic seed)
     """
 
     def __init__(
@@ -64,28 +66,15 @@ class TextureEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.res_channels = res_channels
 
-        # Branch 1: Color-Preserving Residual Path (NO InstanceNorm so RGB palette & lighting are preserved!)
-        # Uses smooth average pooling down to 16x16 and a narrow 16-channel bottleneck to prevent geometry leakage,
-        # then expands to [B, res_channels, 32, 32] for the decoder.
-        bottleneck_ch = 16
-        self.res_color_stem = nn.Sequential(
-            nn.AvgPool2d(kernel_size=4, stride=4),  # 256 -> 64 (smooth color/lighting downsample)
-            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1, padding_mode="reflect"),
+        # 1x1 projection from (color_canvas, mu_rgb, std_rgb, scrambled_stochastic_noise) -> res_channels
+        # Uses ONLY 1x1 convolutions on color + spatially-scrambled noise so zero spatial geometry can leak!
+        stoch_out_ch = max(1, res_channels - 9)
+        self.res_noise_proj = nn.Sequential(
+            nn.Conv2d(9 + 4, stoch_out_ch, kernel_size=1, bias=True),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.AvgPool2d(kernel_size=4, stride=4),  # 64 -> 16 (strips fine geometric edges, keeps palette & lighting)
-            nn.Conv2d(base_channels, bottleneck_ch, kernel_size=3, padding=1, padding_mode="reflect"),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout2d(p=res_dropout) if res_dropout > 0 else nn.Identity(),
-        )
-        self.res_expand = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # 16 -> 32
-            nn.Conv2d(bottleneck_ch, res_channels, kernel_size=3, padding=1, padding_mode="reflect"),
-            nn.LeakyReLU(0.2, inplace=True),
-            ConvResBlock(res_channels, norm_type="none"),
         )
 
-        # Branch 2: Semantic Attribute Extractor Z_attr [B, K, latent_dim]
-        # Uses InstanceNorm/BatchNorm to focus on invariant texture structure & geometry
+        # Semantic Attribute Extractor Z_attr [B, K, latent_dim]
         self.attr_stem = nn.Sequential(
             nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=1, padding=3, padding_mode="reflect", bias=False),
             nn.InstanceNorm2d(base_channels, affine=True),
@@ -116,7 +105,6 @@ class TextureEncoder(nn.Module):
             ConvResBlock(attr_feat_dim, norm_type="batch"),
         )
 
-        # Combine Global Avg Pool + Global Max Pool for texture descriptor richness
         self.attr_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(attr_feat_dim * 2, latent_dim),
@@ -128,11 +116,27 @@ class TextureEncoder(nn.Module):
         ])
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 1. Color & lighting residual (without InstanceNorm color erasure)
-        z_res_low = self.res_color_stem(x)
-        z_res = self.res_expand(z_res_low)
+        bsz = x.size(0)
 
-        # 2. Structural & semantic attribute vectors
+        # 1. Explicit Color Palette & Smooth Lighting Statistics in Z_res (first 9 channels)
+        color_4x4 = F.adaptive_avg_pool2d(x, (4, 4))
+        color_32x32 = F.interpolate(color_4x4, size=(32, 32), mode="bilinear", align_corners=False)  # [B, 3, 32, 32]
+
+        mu_rgb = x.mean(dim=(2, 3), keepdim=True).expand(-1, -1, 32, 32)                             # [B, 3, 32, 32]
+        std_rgb = x.std(dim=(2, 3), keepdim=True).clamp(min=1e-4).expand(-1, -1, 32, 32)             # [B, 3, 32, 32]
+
+        # Spatially-uncorrelated stochastic noise seed (deterministic in eval, random in train)
+        if self.training:
+            noise_32 = torch.randn(bsz, 4, 32, 32, device=x.device, dtype=x.dtype)
+        else:
+            g = torch.Generator(device=x.device).manual_seed(42)
+            noise_32 = torch.randn(bsz, 4, 32, 32, generator=g, device=x.device, dtype=x.dtype)
+
+        base_9 = torch.cat([color_32x32, mu_rgb, std_rgb], dim=1)
+        stoch_res = self.res_noise_proj(torch.cat([base_9, noise_32], dim=1))
+        z_res = torch.cat([base_9, stoch_res], dim=1)                                                # [B, C_res, 32, 32]
+
+        # 2. K Semantic Attribute Vectors
         feat = self.attr_stem(x)
         attr_map = self.attr_trunk(feat)
         avg_pool = attr_map.mean(dim=(2, 3))
