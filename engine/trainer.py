@@ -405,11 +405,13 @@ class CoTyleTrainer:
         n_show = min(4, x_a.size(0))
         grid = torch.cat([x_a[:n_show], x_rec[:n_show], x_b[:n_show], x_swap[:n_show]], dim=0)
         grid = (grid.clamp(-1.0, 1.0) + 1.0) * 0.5
+        os.makedirs(self.save_dir, exist_ok=True)
         out_path = os.path.join(self.save_dir, f"recon_vs_swap_epoch_{epoch:03d}.png")
         save_image(grid, out_path, nrow=n_show)
         return out_path
 
     def save_checkpoint(self, filename: str, epoch: int, extra: Optional[dict] = None) -> str:
+        os.makedirs(self.save_dir, exist_ok=True)
         path = os.path.join(self.save_dir, filename)
         state = {
             "epoch": epoch,
