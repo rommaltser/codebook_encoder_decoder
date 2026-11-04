@@ -2,10 +2,9 @@
 Texture Decoder (G):
 Synthesizes RGB texture images [B, 3, 256, 256] from the spatial residual map Z_res
 modulated by the K quantized attribute vectors Z_quant via AdaIN + SPADE-style conditioning,
-learnable 2D Fourier spatial basis + stochastic noise modulation, and explicit RGB palette restoration.
+stochastic noise modulation, and explicit RGB palette restoration.
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,44 +56,6 @@ class SPADEResidualModulation(nn.Module):
         gamma = self.gamma_conv(actv)
         beta = self.beta_conv(actv)
         return normed * (1.0 + gamma) + beta
-
-
-class SpatialFourierBasis(nn.Module):
-    """
-    Learnable multi-frequency 2D spatial Fourier basis modulated by w_style so
-    the decoder can synthesize periodic & geometric patterns (stripes, grids, hexagons, bubbles)
-    directly from the quantized codebook tokens Z_quant without needing edge leakage from Z_res.
-    """
-
-    def __init__(self, style_dim: int, out_channels: int, num_freqs: int = 32):
-        super().__init__()
-        self.num_freqs = num_freqs
-        # Learnable bank of 2D frequencies initialized across low and medium-high cycles
-        init_freqs = torch.randn(num_freqs, 2) * 4.0
-        self.freqs = nn.Parameter(init_freqs)
-        self.style_to_phase_amp = nn.Linear(style_dim, num_freqs * 3)
-        self.proj = nn.Conv2d(num_freqs * 2, out_channels, kernel_size=1)
-
-    def forward(self, bsz: int, height: int, width: int, w_style: torch.Tensor) -> torch.Tensor:
-        device = w_style.device
-        dtype = w_style.dtype
-        ys = torch.linspace(-math.pi, math.pi, height, device=device, dtype=dtype)
-        xs = torch.linspace(-math.pi, math.pi, width, device=device, dtype=dtype)
-        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        coords = torch.stack([xx, yy], dim=-1)  # [H, W, 2]
-
-        # [H, W, 2] @ [2, F] -> [1, F, H, W]
-        angles = torch.matmul(coords, self.freqs.to(dtype=dtype).t()).permute(2, 0, 1).unsqueeze(0)
-
-        params = self.style_to_phase_amp(w_style).view(bsz, 3, self.num_freqs, 1, 1)
-        amp_sin = torch.tanh(params[:, 0])
-        amp_cos = torch.tanh(params[:, 1])
-        phase = params[:, 2] * math.pi
-
-        sin_map = amp_sin * torch.sin(angles + phase)
-        cos_map = amp_cos * torch.cos(angles + phase)
-        basis = torch.cat([sin_map, cos_map], dim=1)  # [B, 2*F, H, W]
-        return self.proj(basis)
 
 
 class ModulatedDecodeBlock(nn.Module):
@@ -174,7 +135,7 @@ class TextureDecoder(nn.Module):
         self.res_channels = res_channels
 
         # Project each cluster token into its own dedicated subspace and concatenate
-        # so every cluster k has independent, non-canceling control over modulation channels & frequencies
+        # so every cluster k has independent, non-canceling control over modulation channels
         per_cluster_dim = max(32, style_dim // num_clusters)
         concat_dim = per_cluster_dim * num_clusters
         self.cluster_projs = nn.ModuleList([
@@ -194,8 +155,6 @@ class TextureDecoder(nn.Module):
         )
 
         self.in_proj = nn.Conv2d(res_channels, 256, kernel_size=3, padding=1, padding_mode="reflect")
-        self.fourier_32 = SpatialFourierBasis(style_dim, 256, num_freqs=32)
-        self.fourier_64 = SpatialFourierBasis(style_dim, 256, num_freqs=32)
 
         # 32x32 refinement -> 64x64 -> 128x128 -> 256x256
         self.block_32 = ModulatedDecodeBlock(256, 256, res_channels, style_dim, upsample=False)
@@ -216,7 +175,6 @@ class TextureDecoder(nn.Module):
         )
 
     def forward(self, z_quant: torch.Tensor, z_res: torch.Tensor) -> torch.Tensor:
-        bsz = z_quant.shape[0]
         # Concatenate per-cluster projections so each cluster k controls a dedicated slice of style space
         cluster_cat = torch.cat([proj(z_quant[:, k, :]) for k, proj in enumerate(self.cluster_projs)], dim=-1)
         w_style = self.style_mlp(cluster_cat)
@@ -227,9 +185,9 @@ class TextureDecoder(nn.Module):
         std_rgb = z_res[:, 6:9, :1, :1]
         color_canvas = F.interpolate(color_32x32, size=(256, 256), mode="bilinear", align_corners=False)
 
-        h = self.in_proj(z_res) + self.fourier_32(bsz, 32, 32, w_style)
+        h = self.in_proj(z_res)
         h = self.block_32(h, z_res, w_style)
-        h = self.block_64(h, z_res, w_style) + self.fourier_64(bsz, 64, 64, w_style)
+        h = self.block_64(h, z_res, w_style)
         h = self.block_128(h, z_res, w_style)
         h = self.block_256(h, z_res, w_style)
 
