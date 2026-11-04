@@ -112,6 +112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", type=int, default=None, help="Override total training epochs")
     parser.add_argument("--save-dir", type=str, default=None, help="Override checkpoint output directory")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--no-auto-resume", action="store_true", help="Disable automatic resume from save_dir")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda or cpu)")
     parser.add_argument(
         "--synthetic-sanity-check",
@@ -210,9 +211,21 @@ def main() -> None:
     )
 
     start_epoch = 1
-    if args.resume and os.path.isfile(args.resume):
-        start_epoch = trainer.load_checkpoint(args.resume) + 1
-        print(f"Resumed from checkpoint '{args.resume}' at epoch {start_epoch}")
+    save_dir = cfg["optim"].get("save_dir", "checkpoints")
+    resume_path = args.resume
+
+    # Automatically check save_dir for an existing checkpoint if --resume was not explicitly provided
+    if not resume_path and not args.no_auto_resume:
+        latest_cand = os.path.join(save_dir, "checkpoint_latest.pt")
+        phase1_cand = os.path.join(save_dir, "checkpoint_phase1_supervisor.pt")
+        if os.path.isfile(latest_cand):
+            resume_path = latest_cand
+        elif os.path.isfile(phase1_cand):
+            resume_path = phase1_cand
+
+    if resume_path and os.path.isfile(resume_path):
+        start_epoch = trainer.load_checkpoint(resume_path) + 1
+        print(f"Automatically resumed from checkpoint '{resume_path}' at epoch {start_epoch}")
 
     pretrain_epochs = int(cfg["optim"].get("pretrain_epochs", 15))
     max_epochs = int(cfg["optim"].get("max_epochs", 100))
